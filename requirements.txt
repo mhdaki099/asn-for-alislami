@@ -9,7 +9,7 @@ langchain-core
 python-dotenv
 # Image Processing Libraries (compatible versions)
 Pillow>=10.0.0
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0
 numpy>=1.24.0
 scikit-image>=0.21.0
 imageio>=2.31.0
