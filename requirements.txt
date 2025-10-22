@@ -1,0 +1,23 @@
+streamlit
+pandas
+PyPDF2
+openpyxl
+PyMuPDF
+openai>=1.0.0
+langchain
+langchain-core
+python-dotenv
+# Image Processing Libraries (compatible versions)
+Pillow>=10.0.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+scikit-image>=0.21.0
+imageio>=2.31.0
+matplotlib>=3.7.0
+# OCR Libraries (Windows-compatible versions)
+pytesseract>=0.3.10
+# Fix protobuf version conflict
+protobuf<=3.20.3
+# Alternative OCR (if needed)
+# paddleocr>=2.7.0
+# easyocr>=1.7.0
