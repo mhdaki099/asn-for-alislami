@@ -1824,7 +1824,7 @@ ASN (ADVANCE SHIPPING NOTICE) SPECIFIC FIELDS:
 
 OTHER FIELDS:
 - Normalize country codes to full country names when possible
-- Dates: Use dd-MMM-yy format when present, handle various date formats
+- Dates: Use DD.MM.YYYY format when present, handle various date formats (e.g., 30.10.2025)
 - Currency: Infer from context (EUR for Europe, USD for USA, THB for Thailand, etc.)
 - Payer Name: Use "Al-ISLAMI Foods Group LLC" as default
 - Payment Terms: Extract terms like "Net 30", "COD", "Due on receipt" or use "-"
