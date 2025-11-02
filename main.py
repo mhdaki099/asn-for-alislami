@@ -53,6 +53,128 @@ def admin_tracking_tab():
     st.info("User tracking is disabled.")
 
 
+# Define allowed columns for Excel export
+ALLOWED_COLUMNS = [
+    'PO Number',
+    'Item Code',
+    'Description',
+    'Quantity',
+    'Lot Number',
+    'Mfg Date',
+    'Expiry Date',
+    'Invoice No',
+    'Container/Pallet'
+]
+
+
+def filter_allowed_columns(df):
+    """Filter DataFrame to only include allowed columns"""
+    # Get columns that exist in the DataFrame
+    existing_columns = [col for col in ALLOWED_COLUMNS if col in df.columns]
+    # Return DataFrame with only allowed columns
+    return df[existing_columns].copy() if existing_columns else df.copy()
+
+
+def normalize_date(date_str):
+    """
+    Normalize date strings from various formats to MM/YYYY or MM.YYYY format
+    Handles OCR errors and common date patterns
+    """
+    if not date_str or pd.isna(date_str):
+        return ''
+    
+    date_str = str(date_str).strip()
+    if not date_str or date_str == '-' or date_str == '----------':
+        return ''
+    
+    # Remove common OCR artifacts and extra spaces
+    date_str = date_str.replace(' ', '').replace('  ', ' ')
+    
+    # Handle numeric formats like "082025" = 08/2025
+    import re
+    # Pattern: 6 digits that could be MMDDYY or MMYYYY
+    if re.match(r'^\d{6}$', date_str):
+        # Check if it's MMYYYY (more common for production/expiry dates)
+        month = date_str[:2]
+        year_part = date_str[2:]
+        
+        # If year part starts with 20, it's likely MMYYYY format
+        if year_part.startswith('20') and len(year_part) == 4:
+            year = year_part
+            # Validate month (01-12)
+            if 1 <= int(month) <= 12:
+                return f"{month}/{year}"
+        # Otherwise might be MMDDYY - convert to MM/YYYY
+        elif len(year_part) == 2:
+            year = '20' + year_part  # Assume 20XX
+            if 1 <= int(month) <= 12:
+                return f"{month}/{year}"
+    
+    # Handle formats like "08/2025" or "8/2025"
+    match = re.match(r'^(\d{1,2})[/\-\.](\d{4})$', date_str)
+    if match:
+        month = match.group(1).zfill(2)  # Ensure 2 digits
+        year = match.group(2)
+        if 1 <= int(month) <= 12:
+            return f"{month}/{year}"
+    
+    # Handle formats like "08.2025" or "8.2025"
+    match = re.match(r'^(\d{1,2})\.(\d{4})$', date_str)
+    if match:
+        month = match.group(1).zfill(2)
+        year = match.group(2)
+        if 1 <= int(month) <= 12:
+            return f"{month}/{year}"
+    
+    # Handle "AND" separated dates (e.g., "08/2025 AND 09/2025")
+    if 'AND' in date_str.upper():
+        parts = re.split(r'\s+AND\s+', date_str, flags=re.IGNORECASE)
+        normalized_parts = []
+        for part in parts:
+            norm_part = normalize_date(part.strip())
+            if norm_part:
+                normalized_parts.append(norm_part)
+        if normalized_parts:
+            return ' AND '.join(normalized_parts)
+    
+    # If no pattern matches, return as-is (might be already correct)
+    return date_str
+
+
+def is_separator_row(row, df):
+    """Check if a row is a separator row (contains dashes, FILE SEPARATOR, etc.)"""
+    try:
+        # Check for FILE SEPARATOR text
+        row_str = ' '.join(str(val) for val in row.values if pd.notna(val))
+        if 'FILE SEPARATOR' in row_str.upper():
+            return True
+        
+        # Check if Description column contains mostly dashes
+        if 'Description' in df.columns:
+            desc_value = str(row.get('Description', '')) if pd.notna(row.get('Description', '')) else ''
+            # Check if description is mostly dashes (like "-----" or "--------------------")
+            if desc_value and desc_value.strip().replace('-', '').replace(' ', '') == '':
+                if len(desc_value.strip()) > 3:  # At least 4 dashes
+                    return True
+        
+        # Check if multiple columns contain dashes (separator pattern)
+        dash_count = 0
+        for col in df.columns:
+            if col not in ['BATCH', 'STORAGE LOCATION', 'PO']:  # Exclude manual columns
+                val = str(row.get(col, '')) if pd.notna(row.get(col, '')) else ''
+                if val and val.strip().replace('-', '').replace(' ', '') == '':
+                    if len(val.strip()) > 2:  # At least 3 dashes
+                        dash_count += 1
+        
+        # If more than 2 columns have dashes, likely a separator row
+        if dash_count >= 2:
+            return True
+        
+        return False
+    except Exception:
+        return False
+
+
 def display_excel_native(excel_data):
     """Display Excel data using native Streamlit components with persistent editing"""
     try:
@@ -1822,6 +1944,42 @@ ASN (ADVANCE SHIPPING NOTICE) SPECIFIC FIELDS:
 - Container/Pallet Information: Extract container numbers, pallet IDs
 - Bill of Lading: Extract BOL numbers if present
 
+MANUFACTURING DATE (Mfg Date) AND EXPIRY DATE EXTRACTION - CRITICAL:
+- These dates are often found in PACKING LISTS, at the bottom of pages, or on separate pages
+- Search the ENTIRE document for "Production Date", "Manufacturing Date", "Mfg Date", "Prod Date", "Expiry Date", "Best Before", "Use By"
+- CRITICAL: Extract dates EXACTLY as they appear in the document - DO NOT guess or infer dates
+- CRITICAL: DO NOT mix Production Date and Expiry Date - they are DIFFERENT fields
+  * Mfg Date (Production Date) = When the product was manufactured/produced
+  * Expiry Date = When the product expires/use by date
+  * Expiry Date is ALWAYS LATER than Production Date (same or future date)
+- CRITICAL: Match each date to the CORRECT column:
+  * If the packing list has a "Production Date" column, put those values ONLY in "Mfg Date"
+  * If the packing list has an "Expiry Date" column, put those values ONLY in "Expiry Date"
+  * DO NOT put Production Date values in the Expiry Date column
+  * DO NOT put Expiry Date values in the Mfg Date column
+- If the PDF shows "08/2025" or "082025", extract it as "08/2025" - DO NOT convert to "05.2023" or any other format
+- Dates may appear in various formats: 
+  * MM/YYYY format: "08/2025", "09/2025", "07/2026"
+  * Numeric codes: "082025" = 08/2025, "092025" = 09/2025, "072026" = 07/2026
+  * With slashes: "8/2025" = 08/2025, "9/2025" = 09/2025
+  * Multiple dates: "08/2025 AND 09/2025" (keep both separated by AND)
+- Look in packing list tables, which often have SEPARATE columns for Production Date and Expiry Date
+- Match dates to the correct product/item AND correct date type (Production vs Expiry) even if they appear in different sections or pages
+- IMPORTANT: When reading packing list tables:
+  * Find the column header "Production Date" - extract those values for Mfg Date
+  * Find the column header "Expiry Date" - extract those values for Expiry Date
+  * Each row should have the Production Date from the Production Date column and Expiry Date from the Expiry Date column
+- If multiple production/expiry dates exist for the same item (different batches), create separate rows OR combine with "AND"
+- Common date patterns to recognize:
+  * "082025" or "08/2025" = 08/2025 (August 2025)
+  * "09/2025" or "092025" = 09/2025 (September 2025)
+  * "07/2026" or "072026" = 07/2026 (July 2026)
+  * Handle OCR errors: "092025" (missing slash) should be interpreted as "09/2025"
+  * DO NOT assume years - if you see "082025", it's 2025, NOT 2023
+- Output dates in MM/YYYY format when possible (e.g., "08/2025" not "05.2023")
+- If dates are not in the main invoice table, search packing lists, supplementary pages, and any other sections
+- If still not found after thorough search, use "-"
+
 OTHER FIELDS:
 - Normalize country codes to full country names when possible
 - Dates: Use DD.MM.YYYY format when present, handle various date formats (e.g., 30.10.2025)
@@ -1832,7 +1990,9 @@ OTHER FIELDS:
 
 OUTPUT FORMAT:
 Return ONLY a Markdown table with these exact columns in this order:
-| PO Number | Item Code | Description | UOM | Quantity | Net Weight | Lot Number | Expiry Date | Mfg Date | Promised Date | Need by Date | Invoice No | Unit Price | Total Price | Country | HS Code | Invoice Date | Customer No | Payer Name | Currency | Supplier | Invoice Total | VAT | Payment Terms | Freight Terms | ASN Number | Ship Date | Carrier | Tracking Number | Delivery Date | Warehouse Location | Destination | Container/Pallet | Bill of Lading |
+| PO Number | Item Code | Description | Quantity | Lot Number | Mfg Date | Expiry Date | Invoice No | Container/Pallet |
+
+NOTE: Only include the columns listed above. If Lot Number is not available, use "-". All other columns should be omitted.
 
 Include the separator line and one row per item/batch combination.
 Handle OCR-extracted text with intelligent error correction.
@@ -1846,10 +2006,15 @@ Handle OCR-extracted text with intelligent error correction.
                 {
                     "role": "system",
                     "content": (
-                        "You are an expert at extracting structured data from invoices for Al-ISLAMI Foods Group LLC, "
+                        "You are an expert at extracting structured data from invoices and packing lists for Al-ISLAMI Foods Group LLC, "
                         "especially from OCR-processed text. Pay special attention to extracting accurate Item Codes/Product Codes, "
-                        "detailed Product Descriptions, and HS Codes. Handle formatting issues, character recognition errors, "
-                        "and fragmented text with high accuracy. Always return complete, properly formatted tables."
+                        "detailed Product Descriptions, HS Codes, and CRITICALLY important: Production Dates (Mfg Date) and Expiry Dates. "
+                        "CRITICAL: Production Date and Expiry Date are DIFFERENT fields - do NOT mix them. "
+                        "Production Date values go ONLY in Mfg Date column. Expiry Date values go ONLY in Expiry Date column. "
+                        "These dates are often found in packing lists with separate columns for each date type - search the ENTIRE document thoroughly. "
+                        "Match each date to the correct column and correct product row. "
+                        "Handle formatting issues, character recognition errors, and fragmented text with high accuracy. "
+                        "Always return complete, properly formatted tables with all available date information correctly placed."
                     ),
                 },
                 {"role": "user", "content": prompt},
@@ -1868,10 +2033,15 @@ Handle OCR-extracted text with intelligent error correction.
                     {
                         "role": "system",
                         "content": (
-                        "You are an expert at extracting structured data from invoices for Al-ISLAMI Foods Group LLC, "
+                        "You are an expert at extracting structured data from invoices and packing lists for Al-ISLAMI Foods Group LLC, "
                         "especially from OCR-processed text. Pay special attention to extracting accurate Item Codes/Product Codes, "
-                        "detailed Product Descriptions, and HS Codes. Handle formatting issues, character recognition errors, "
-                        "and fragmented text with high accuracy. Always return complete, properly formatted tables."
+                        "detailed Product Descriptions, HS Codes, and CRITICALLY important: Production Dates (Mfg Date) and Expiry Dates. "
+                        "CRITICAL: Production Date and Expiry Date are DIFFERENT fields - do NOT mix them. "
+                        "Production Date values go ONLY in Mfg Date column. Expiry Date values go ONLY in Expiry Date column. "
+                        "These dates are often found in packing lists with separate columns for each date type - search the ENTIRE document thoroughly. "
+                        "Match each date to the correct column and correct product row. "
+                        "Handle formatting issues, character recognition errors, and fragmented text with high accuracy. "
+                        "Always return complete, properly formatted tables with all available date information correctly placed."
                         ),
                     },
                     {"role": "user", "content": prompt},
@@ -2015,9 +2185,110 @@ def main_app():
         pdfs_to_process = st.session_state.uploaded_pdfs or uploaded_pdfs
 
         if pdfs_to_process:
+            # Manual input form for additional information (shown before extraction)
+            st.markdown("---")
+            st.markdown("### ➕ Add Manual Information (Before Extraction)")
+            manual_col1, manual_col2, manual_col3 = st.columns(3)
+            
+            # Initialize manual values in session state if not exists
+            if 'pre_extract_batch' not in st.session_state:
+                st.session_state.pre_extract_batch = ''
+            if 'pre_extract_storage' not in st.session_state:
+                st.session_state.pre_extract_storage = ''
+            if 'pre_extract_po' not in st.session_state:
+                st.session_state.pre_extract_po = ''
+            
+            with manual_col1:
+                st.text_input("BATCH", value=st.session_state.pre_extract_batch, key="pre_extract_batch", help="Enter the batch number (will be applied to all rows after extraction)")
+            with manual_col2:
+                st.text_input("STORAGE LOCATION", value=st.session_state.pre_extract_storage, key="pre_extract_storage", help="Enter the storage location (will be applied to all rows after extraction)")
+            with manual_col3:
+                st.text_input("PO", value=st.session_state.pre_extract_po, key="pre_extract_po", help="Enter the PO number (will be applied to all rows after extraction)")
+            
             if st.session_state.edited_df is not None:
                 try:
+                    # Filter to only allowed columns
+                    filtered_df_allowed = filter_allowed_columns(st.session_state.edited_df)
+                    st.session_state.edited_df = filtered_df_allowed.copy()
+                    
                     st.markdown("### 📊 Extracted and Edited Data")
+                    
+                    # Manual input form for additional information
+                    st.markdown("---")
+                    st.markdown("### ➕ Add Manual Information")
+                    manual_col1, manual_col2, manual_col3 = st.columns(3)
+                    
+                    # Initialize manual input columns if they don't exist
+                    if 'BATCH' not in st.session_state.edited_df.columns:
+                        st.session_state.edited_df['BATCH'] = ''
+                    if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                        st.session_state.edited_df['STORAGE LOCATION'] = ''
+                    if 'PO' not in st.session_state.edited_df.columns:
+                        st.session_state.edited_df['PO'] = ''
+                    
+                    # Apply pre-extraction values if they exist (skip separator rows)
+                    if st.session_state.pre_extract_batch or st.session_state.pre_extract_storage or st.session_state.pre_extract_po:
+                        # Initialize columns if needed
+                        if 'BATCH' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['BATCH'] = ''
+                        if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['STORAGE LOCATION'] = ''
+                        if 'PO' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['PO'] = ''
+                        
+                        # Apply values only to non-separator rows
+                        for idx in st.session_state.edited_df.index:
+                            row = st.session_state.edited_df.loc[idx]
+                            if not is_separator_row(row, st.session_state.edited_df):
+                                if st.session_state.pre_extract_batch:
+                                    st.session_state.edited_df.at[idx, 'BATCH'] = st.session_state.pre_extract_batch
+                                if st.session_state.pre_extract_storage:
+                                    st.session_state.edited_df.at[idx, 'STORAGE LOCATION'] = st.session_state.pre_extract_storage
+                                if st.session_state.pre_extract_po:
+                                    st.session_state.edited_df.at[idx, 'PO'] = st.session_state.pre_extract_po
+                    
+                    # Get current values from the first row (if they exist and are not empty)
+                    current_batch = ''
+                    current_storage = ''
+                    current_po = ''
+                    if len(st.session_state.edited_df) > 0:
+                        batch_vals = st.session_state.edited_df['BATCH'].dropna().tolist()
+                        if batch_vals and batch_vals[0]:
+                            current_batch = str(batch_vals[0])
+                        storage_vals = st.session_state.edited_df['STORAGE LOCATION'].dropna().tolist()
+                        if storage_vals and storage_vals[0]:
+                            current_storage = str(storage_vals[0])
+                        po_vals = st.session_state.edited_df['PO'].dropna().tolist()
+                        if po_vals and po_vals[0]:
+                            current_po = str(po_vals[0])
+                    
+                    with manual_col1:
+                        batch_value = st.text_input("BATCH", value=current_batch, key="manual_batch_existing", help="Enter the batch number (will be applied to all rows)")
+                    with manual_col2:
+                        storage_location = st.text_input("STORAGE LOCATION", value=current_storage, key="manual_storage_existing", help="Enter the storage location (will be applied to all rows)")
+                    with manual_col3:
+                        po_value = st.text_input("PO", value=current_po, key="manual_po_existing", help="Enter the PO number (will be applied to all rows)")
+                    
+                    # Update all rows with manual input values (skip separator rows)
+                    if batch_value or storage_location or po_value:
+                        # Ensure columns exist
+                        if 'BATCH' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['BATCH'] = ''
+                        if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['STORAGE LOCATION'] = ''
+                        if 'PO' not in st.session_state.edited_df.columns:
+                            st.session_state.edited_df['PO'] = ''
+                        
+                        # Apply values only to non-separator rows
+                        for idx in st.session_state.edited_df.index:
+                            row = st.session_state.edited_df.loc[idx]
+                            if not is_separator_row(row, st.session_state.edited_df):
+                                if batch_value:
+                                    st.session_state.edited_df.at[idx, 'BATCH'] = batch_value
+                                if storage_location:
+                                    st.session_state.edited_df.at[idx, 'STORAGE LOCATION'] = storage_location
+                                if po_value:
+                                    st.session_state.edited_df.at[idx, 'PO'] = po_value
                     
                     search_query = st.text_input("🔍 Search in data:", placeholder="Type to search...", key=f"search_input_{st.session_state.grid_key}")
                     
@@ -2053,10 +2324,20 @@ def main_app():
                     </div>
                     """, unsafe_allow_html=True)
                     
+                    # Reorder columns for Excel export (manual columns at the end)
+                    excel_columns_order = [col for col in ALLOWED_COLUMNS if col in edited_df.columns]
+                    manual_columns = ['BATCH', 'STORAGE LOCATION', 'PO']
+                    manual_columns_order = [col for col in manual_columns if col in edited_df.columns]
+                    final_order = excel_columns_order + manual_columns_order
+                    # Add any remaining columns that weren't in the order lists
+                    remaining_cols = [col for col in edited_df.columns if col not in final_order]
+                    final_order = final_order + remaining_cols
+                    edited_df_ordered = edited_df[final_order]
+                    
                     # Download Excel File button
                     buffer = io.BytesIO()
                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                        edited_df.to_excel(writer, index=False)
+                        edited_df_ordered.to_excel(writer, index=False)
                     
                     st.download_button(
                         label="📥 Download Excel File",
@@ -2162,7 +2443,94 @@ def main_app():
                                 st.session_state.edited_df = df.copy()
                                 
                                 try:
+                                    # Normalize date columns (Mfg Date and Expiry Date)
+                                    if 'Mfg Date' in st.session_state.edited_df.columns:
+                                        st.session_state.edited_df['Mfg Date'] = st.session_state.edited_df['Mfg Date'].apply(normalize_date)
+                                    if 'Expiry Date' in st.session_state.edited_df.columns:
+                                        st.session_state.edited_df['Expiry Date'] = st.session_state.edited_df['Expiry Date'].apply(normalize_date)
+                                    
+                                    # Filter to only allowed columns
+                                    filtered_df_allowed = filter_allowed_columns(st.session_state.edited_df)
+                                    st.session_state.edited_df = filtered_df_allowed.copy()
+                                    
                                     st.markdown("### 📝 Edit Extracted Data")
+                                    
+                                    # Manual input form for additional information
+                                    st.markdown("---")
+                                    st.markdown("### ➕ Add Manual Information")
+                                    manual_col1, manual_col2, manual_col3 = st.columns(3)
+                                    
+                                    # Initialize manual input columns if they don't exist
+                                    if 'BATCH' not in st.session_state.edited_df.columns:
+                                        st.session_state.edited_df['BATCH'] = ''
+                                    if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                                        st.session_state.edited_df['STORAGE LOCATION'] = ''
+                                    if 'PO' not in st.session_state.edited_df.columns:
+                                        st.session_state.edited_df['PO'] = ''
+                                    
+                                    # Apply pre-extraction values if they exist (skip separator rows)
+                                    if st.session_state.pre_extract_batch or st.session_state.pre_extract_storage or st.session_state.pre_extract_po:
+                                        # Initialize columns if needed
+                                        if 'BATCH' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['BATCH'] = ''
+                                        if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['STORAGE LOCATION'] = ''
+                                        if 'PO' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['PO'] = ''
+                                        
+                                        # Apply values only to non-separator rows
+                                        for idx in st.session_state.edited_df.index:
+                                            row = st.session_state.edited_df.loc[idx]
+                                            if not is_separator_row(row, st.session_state.edited_df):
+                                                if st.session_state.pre_extract_batch:
+                                                    st.session_state.edited_df.at[idx, 'BATCH'] = st.session_state.pre_extract_batch
+                                                if st.session_state.pre_extract_storage:
+                                                    st.session_state.edited_df.at[idx, 'STORAGE LOCATION'] = st.session_state.pre_extract_storage
+                                                if st.session_state.pre_extract_po:
+                                                    st.session_state.edited_df.at[idx, 'PO'] = st.session_state.pre_extract_po
+                                    
+                                    # Get current values from the first row (if they exist and are not empty)
+                                    current_batch = ''
+                                    current_storage = ''
+                                    current_po = ''
+                                    if len(st.session_state.edited_df) > 0:
+                                        batch_vals = st.session_state.edited_df['BATCH'].dropna().tolist()
+                                        if batch_vals and batch_vals[0]:
+                                            current_batch = str(batch_vals[0])
+                                        storage_vals = st.session_state.edited_df['STORAGE LOCATION'].dropna().tolist()
+                                        if storage_vals and storage_vals[0]:
+                                            current_storage = str(storage_vals[0])
+                                        po_vals = st.session_state.edited_df['PO'].dropna().tolist()
+                                        if po_vals and po_vals[0]:
+                                            current_po = str(po_vals[0])
+                                    
+                                    with manual_col1:
+                                        batch_value = st.text_input("BATCH", value=current_batch, key="manual_batch", help="Enter the batch number (will be applied to all rows)")
+                                    with manual_col2:
+                                        storage_location = st.text_input("STORAGE LOCATION", value=current_storage, key="manual_storage", help="Enter the storage location (will be applied to all rows)")
+                                    with manual_col3:
+                                        po_value = st.text_input("PO", value=current_po, key="manual_po", help="Enter the PO number (will be applied to all rows)")
+                                    
+                                    # Update all rows with manual input values (skip separator rows)
+                                    if batch_value or storage_location or po_value:
+                                        # Ensure columns exist
+                                        if 'BATCH' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['BATCH'] = ''
+                                        if 'STORAGE LOCATION' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['STORAGE LOCATION'] = ''
+                                        if 'PO' not in st.session_state.edited_df.columns:
+                                            st.session_state.edited_df['PO'] = ''
+                                        
+                                        # Apply values only to non-separator rows
+                                        for idx in st.session_state.edited_df.index:
+                                            row = st.session_state.edited_df.loc[idx]
+                                            if not is_separator_row(row, st.session_state.edited_df):
+                                                if batch_value:
+                                                    st.session_state.edited_df.at[idx, 'BATCH'] = batch_value
+                                                if storage_location:
+                                                    st.session_state.edited_df.at[idx, 'STORAGE LOCATION'] = storage_location
+                                                if po_value:
+                                                    st.session_state.edited_df.at[idx, 'PO'] = po_value
                                     
                                     edited_df = st.data_editor(
                                         st.session_state.edited_df,
@@ -2185,10 +2553,20 @@ def main_app():
                                     st.session_state.edited_df = edited_df
                                     st.markdown(f"**Total Rows:** {len(filtered_df)} | **Total Columns:** {len(filtered_df.columns)}")
 
+                                    # Reorder columns for Excel export (manual columns at the end)
+                                    excel_columns_order = [col for col in ALLOWED_COLUMNS if col in edited_df.columns]
+                                    manual_columns = ['BATCH', 'STORAGE LOCATION', 'PO']
+                                    manual_columns_order = [col for col in manual_columns if col in edited_df.columns]
+                                    final_order = excel_columns_order + manual_columns_order
+                                    # Add any remaining columns that weren't in the order lists
+                                    remaining_cols = [col for col in edited_df.columns if col not in final_order]
+                                    final_order = final_order + remaining_cols
+                                    edited_df_ordered = edited_df[final_order]
+                                    
                                     # Download Excel File button
                                     buffer = io.BytesIO()
                                     with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                                        edited_df.to_excel(writer, index=False)
+                                        edited_df_ordered.to_excel(writer, index=False)
                                     
                                     st.download_button(
                                         label="📥 Download Excel File",
